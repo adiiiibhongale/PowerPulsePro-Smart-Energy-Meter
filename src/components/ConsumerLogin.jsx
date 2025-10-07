@@ -1,4 +1,6 @@
 import React, { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import axios from 'axios';
 import Logo from '../assets/Logo.jpg';
 
 // Icons with inline styles (no Tailwind classes)
@@ -403,6 +405,7 @@ const getResponsiveStyles = (screenWidth, isTouchDevice = false) => {
 };
 
 const ConsumerLogin = () => {
+  const navigate = useNavigate();
   const [consumerId, setConsumerId] = useState('');
   const [password, setPassword] = useState('');
   const [showPassword, setShowPassword] = useState(false);
@@ -421,21 +424,50 @@ const ConsumerLogin = () => {
   const isFormValid = isConsumerIdValid && isPasswordValid;
 
   // Handle form submit
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
     setError('');
     if (!isFormValid) {
       setError('Please enter valid credentials.');
       return;
     }
+    
     setLoading(true);
-    // TODO: Integrate with backend/Firebase authentication here
-    // Never store plain passwords; always hash/encrypt before sending
-    setTimeout(() => {
+    
+    try {
+      // Backend API endpoint
+      const API_BASE_URL = 'http://localhost:5000/api';
+      
+      // Login request with consumer number
+      const loginResponse = await axios.post(`${API_BASE_URL}/auth/consumer/login`, {
+        consumerNumber: consumerId,
+        password: password
+      });
+
+      if (loginResponse.data.status === 'success') {
+        // Store token in localStorage
+        localStorage.setItem('token', loginResponse.data.data.token);
+        localStorage.setItem('user', JSON.stringify(loginResponse.data.data.consumer));
+        
+        // Clear any previous errors
+        setError('');
+        
+        // Navigate to consumer dashboard
+        navigate('/consumer-dashboard');
+      }
+    } catch (error) {
+      console.error('Login error:', error);
+      
+      if (error.response?.data?.message) {
+        setError(error.response.data.message);
+      } else if (error.code === 'ECONNREFUSED') {
+        setError('Unable to connect to server. Please make sure the backend is running.');
+      } else {
+        setError('Login failed. Please try again.');
+      }
+    } finally {
       setLoading(false);
-      // Simulate error for demo
-      setError('Invalid credentials. Please try again.');
-    }, 1500);
+    }
   };
 
   return (
@@ -529,6 +561,7 @@ const ConsumerLogin = () => {
             Remember Me
           </label>
         </div>
+
         {error && (
           <div style={responsiveStyles.error} role="alert">
             {error}

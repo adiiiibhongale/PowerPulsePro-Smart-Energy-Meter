@@ -1,4 +1,5 @@
-import React, { useState, useEffect } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { subscribeReadings, subscribeEvents, readingToUsage } from '../firebase';
 import { useNavigate } from 'react-router-dom';
 import Logo from '../assets/Logo.jpg';
 
@@ -308,47 +309,430 @@ const useScreenSize = () => {
 
 const CustomerDashboard = () => {
   const [loading, setLoading] = useState(true);
-  const [meterData, setMeterData] = useState(null);
+  const buildZeroMetrics = (historyLen = 10) => ({
+    voltage: { current: 0, min: 0, max: 0, status: 'offline', history: Array(historyLen).fill(0) },
+    current: { current: 0, min: 0, max: 0, status: 'offline', history: Array(historyLen).fill(0) },
+    power: { current: 0, min: 0, max: 0, status: 'offline', history: Array(historyLen).fill(0) },
+    energy: { current: 0, min: 0, max: 0, status: 'offline', history: Array(historyLen).fill(0) },
+    powerFactor: { current: 0, min: 0, max: 0, status: 'offline', history: Array(historyLen).fill(0) },
+    frequency: { current: 0, min: 0, max: 0, status: 'offline', history: Array(historyLen).fill(0) }
+  });
+  const [meterData, setMeterData] = useState(buildZeroMetrics());
   const [alerts, setAlerts] = useState([]);
   const [lastUpdate, setLastUpdate] = useState(new Date());
-  const [deviceOnline, setDeviceOnline] = useState(true);
+  // Start as offline; switch to online only after first realtime reading/event arrives
+  const [deviceOnline, setDeviceOnline] = useState(false);
   const [hoveredButton, setHoveredButton] = useState(null);
+  const lastRealtimeRef = useRef(null); // timestamp (ms) of last realtime reading
+  const lastDataTimestampRef = useRef(null); // latest reading's embedded timestamp
+  const lastDataArrivalRef = useRef(null);   // wall-clock when that reading first arrived
+  const lastAnyArrivalRef = useRef(null);    // wall-clock of any readings callback (heartbeat)
+  const initialReadingTsRef = useRef(null);  // reading timestamp present at mount (if any)
+  const hasFreshAfterMountRef = useRef(false); // set true only when a new (advanced) reading arrives after mount
+  const callbacksCountRef = useRef(0); // number of reading callbacks (heartbeats)
+  const startTimeRef = useRef(Date.now());
   const navigate = useNavigate();
   const screenSize = useScreenSize();
   const isMobile = screenSize.width <= 768;
   const isTablet = screenSize.width > 768 && screenSize.width <= 1024;
+  // Persistent ref to hold merged realtime + sample data; must be declared at top level (not inside useEffect)
+  const stateRef = useRef(null);
+  const realtimeReceivedRef = useRef({}); // tracks which keys have received realtime values
+  const [usingSampleOnly, setUsingSampleOnly] = useState(true); // retained if needed for future UI, not used now
+  const firstReadingReceivedRef = useRef(false); // prevents premature offline display after refresh
+  const autoRefreshTimerRef = useRef(null); // timer for 10s auto refresh after data comes or stops
+  // Consumer identity (from login stored in localStorage by ConsumerLogin)
+  const [consumerLabel, setConsumerLabel] = useState('Consumer');
+  useEffect(() => {
+    try {
+      const raw = typeof window !== 'undefined' ? localStorage.getItem('user') : null;
+      if (raw) {
+        const parsed = JSON.parse(raw);
+        // Common possible keys: name, fullName, consumerName, consumerNumber, consumerId, id
+        const label = parsed?.name || parsed?.fullName || parsed?.consumerName || parsed?.consumerNumber || parsed?.consumerId || parsed?.id;
+        if (label) {
+          // Shorten very long labels for UI neatness
+          const trimmed = String(label).trim();
+          setConsumerLabel(trimmed.length > 18 ? trimmed.slice(0,15) + '…' : trimmed);
+        }
+      }
+    } catch (e) {
+      console.warn('Failed to parse stored user info', e);
+    }
+  }, []);
   // Get responsive styles
   const responsiveStyles = getResponsiveStyles(screenSize.width, screenSize.isTouchDevice);
+  // Shorten label further for narrow mobile widths
+  const displayConsumerLabel = React.useMemo(() => {
+    if (!consumerLabel) return 'Consumer';
+    if (isMobile) {
+      const clean = consumerLabel.trim();
+      return clean.length > 12 ? clean.slice(0, 9) + '…' : clean;
+    }
+    return consumerLabel;
+  }, [consumerLabel, isMobile]);
   useEffect(() => {
-    const fetchData = async () => {
-      setLoading(true);
-      setTimeout(() => {
-        setMeterData({
-          voltage: { current: 230.5, min: 228.2, max: 232.1, status: 'normal', history: [228, 229, 230, 231, 230, 229, 230, 231, 230, 229] },
-          current: { current: 12.3, min: 10.5, max: 15.2, status: 'normal', history: [11, 12, 13, 12, 11, 12, 13, 14, 13, 12] },
-          power: { current: 2834, min: 2410, max: 3512, status: 'warning', history: [2400, 2500, 2600, 2700, 2800, 2900, 3000, 2900, 2800, 2834] },
-          energy: { current: 156.78, min: 0, max: 200, status: 'normal', history: [140, 145, 150, 152, 154, 156, 157, 156, 156, 156.78] },
-          powerFactor: { current: 0.85, min: 0.80, max: 0.95, status: 'warning', history: [0.82, 0.83, 0.84, 0.85, 0.86, 0.85, 0.84, 0.85, 0.86, 0.85] },
-          frequency: { current: 50.02, min: 49.8, max: 50.3, status: 'normal', history: [49.9, 50.0, 50.1, 50.0, 49.9, 50.0, 50.1, 50.2, 50.1, 50.02] }
+    let unsubscribers = [];
+    // Initialize accumulator (no sample data)
+    stateRef.current = { currentUsage: null, powerQuality: null, meterReadings: {}, alerts: {} };
+
+    function scheduleAutoRefresh({ reason, delayMs }) {
+      if (autoRefreshTimerRef.current) clearTimeout(autoRefreshTimerRef.current);
+      if (typeof window === 'undefined') return;
+      autoRefreshTimerRef.current = setTimeout(() => {
+        try {
+          console.info('[AutoRefresh]', 'reloading due to', reason);
+          window.location.reload();
+        } catch (_) {}
+      }, delayMs);
+    }
+
+    function recompute() {
+      const readingsObj = stateRef.current.meterReadings || {};
+      const allReadingsSorted = Object.values(readingsObj).sort((a,b)=>a.timestamp-b.timestamp);
+      const THRESHOLDS = {
+        FRESH_WINDOW_MS: 60000,          // reading timestamp not older than 60s
+        ARRIVAL_WINDOW_MS: 60000,        // heartbeat within last 60s
+        MAX_STATIC_AGE_MS: 10 * 60 * 1000, // timestamp unchanged for >10min => offline
+        FUTURE_TOLERANCE_MS: 5000,       // allow 5s clock skew forward
+        MIN_HEARTBEATS_FOR_ONLINE: 2     // allow online after 2 callbacks even if timestamp unchanged
+      };
+  // NOTE: We no longer auto-accept an old initial reading; must receive a NEW timestamp
+      const now = Date.now();
+
+      if (!allReadingsSorted.length) {
+        // During initial mount grace period, don't flip UI to offline yet; keep loading spinner
+        const MOUNT_GRACE_MS = 8000; // 8s grace
+        const sinceMount = now - startTimeRef.current;
+        if (sinceMount < MOUNT_GRACE_MS && !firstReadingReceivedRef.current) {
+          // schedule a slower refresh (30s) only if still nothing
+          scheduleAutoRefresh({ reason: 'no-initial-data', delayMs: 30000 });
+          // Just wait for first data silently
+          return;
+        }
+        if (firstReadingReceivedRef.current) {
+          // We had data before, now none -> treat as offline
+          setDeviceOnline(false);
+          setMeterData(buildZeroMetrics());
+          setAlerts([]);
+          setLastUpdate(new Date());
+          setLoading(false);
+          scheduleAutoRefresh({ reason: 'lost-data', delayMs: 15000 });
+        } else {
+          // Still no data after grace, show offline state
+          setDeviceOnline(false);
+          setMeterData(buildZeroMetrics());
+          setAlerts([]);
+          setLastUpdate(new Date());
+          setLoading(false);
+          scheduleAutoRefresh({ reason: 'no-data-post-grace', delayMs: 15000 });
+        }
+        return;
+      }
+
+      const latestReading = allReadingsSorted[allReadingsSorted.length - 1];
+      let latestTs = latestReading.timestamp;
+      // Normalize seconds-based timestamps to ms if needed
+      if (latestTs < 1e12) {
+        latestTs = latestTs * 1000; // convert seconds to ms
+      }
+      const readingAge = now - latestTs;
+      const futureSkew = latestTs - now;
+      // Track first arrival of a new timestamp
+      if (lastDataTimestampRef.current !== latestTs) {
+        lastDataTimestampRef.current = latestTs;
+        lastDataArrivalRef.current = now;
+      }
+      // Record initial reading timestamp once
+      if (initialReadingTsRef.current === null) {
+        initialReadingTsRef.current = latestTs;
+      }
+
+      // Determine if this qualifies as a fresh reading after mount:
+      // Case A: timestamp advanced beyond the initial one
+      // Case B: initial reading is itself very recent (age <= INITIAL_ACCEPTABLE_AGE_MS)
+      if (!hasFreshAfterMountRef.current && latestTs !== initialReadingTsRef.current) {
+        hasFreshAfterMountRef.current = true; // first post-mount new timestamp
+      }
+      const staticAge = lastDataArrivalRef.current ? now - lastDataArrivalRef.current : Infinity;
+      const arrivalHeartbeatAge = lastAnyArrivalRef.current ? now - lastAnyArrivalRef.current : Infinity;
+      // Online conditions:
+      // 1. We have at least one reading
+      // 2. Either timestamp age acceptable OR we recently received a heartbeat (callback fired)
+      // 3. Timestamp not absurdly in future
+      // 4. Timestamp not static for too long
+      const timestampReasonable = readingAge <= THRESHOLDS.FRESH_WINDOW_MS && futureSkew <= THRESHOLDS.FUTURE_TOLERANCE_MS;
+      const recentHeartbeat = arrivalHeartbeatAge <= THRESHOLDS.ARRIVAL_WINDOW_MS;
+      const staticTooLong = staticAge > THRESHOLDS.MAX_STATIC_AGE_MS;
+      const heartbeatsCount = callbacksCountRef.current;
+      const heartbeatSufficient = heartbeatsCount >= THRESHOLDS.MIN_HEARTBEATS_FOR_ONLINE;
+      // Extended acceptable age when we are at least receiving heartbeats (helps if device repeats last timestamp)
+      const extendedAcceptableAge = THRESHOLDS.FRESH_WINDOW_MS * 5; // e.g., up to 5 minutes
+      const shouldBeOnline = !staticTooLong && recentHeartbeat && (
+        timestampReasonable ||
+        (heartbeatSufficient && readingAge <= extendedAcceptableAge)
+      );
+
+      // Debug logging (can be disabled by commenting)
+      if (process.env.NODE_ENV !== 'production') {
+        console.info('[DeviceStatusDebug]', {
+          latestTs,
+          readingAge,
+            futureSkew,
+          timestampReasonable,
+          recentHeartbeat,
+          staticTooLong,
+          hasFreshAfterMount: hasFreshAfterMountRef.current,
+          shouldBeOnline,
+          arrivalHeartbeatAge,
+          staticAge,
+          heartbeatsCount,
+          heartbeatSufficient,
+          extendedAcceptableAge
         });
-        setAlerts([
-          { id: 1, type: 'warning', message: 'Power factor below optimal range', time: '2 minutes ago' },
-          { id: 2, type: 'info', message: 'Monthly usage 75% of limit', time: '1 hour ago' },
-          { id: 3, type: 'critical', message: 'Tamper event detected', time: '3 hours ago' }
-        ]);
+      }
+
+      if (!shouldBeOnline) {
+        if (deviceOnline) setDeviceOnline(false);
+        setMeterData(buildZeroMetrics());
         setLastUpdate(new Date());
         setLoading(false);
-      }, 1500);
+        // schedule refresh ONLY when offline (avoid loop while online)
+        scheduleAutoRefresh({ reason: 'offline-retry', delayMs: 20000 });
+        return;
+      } else if (!deviceOnline) {
+        setDeviceOnline(true);
+        firstReadingReceivedRef.current = true; // mark that we have displayed at least one live reading
+        // do NOT auto-refresh just because we became online
+      }
+      const currentUsage = stateRef.current.currentUsage; // set by subscription
+      const powerQuality = stateRef.current.powerQuality;
+      if (!currentUsage || !powerQuality) {
+        // Shouldn't happen if subscription populated
+        setLoading(false);
+        return;
+      }
+      const readings = allReadingsSorted.slice(-10);
+      const alertsObj = stateRef.current.alerts || {};
+      const alertsArray = Object.values(alertsObj).sort((a,b)=>b.timestamp-a.timestamp);
+
+      // --- Compute observed statistics from full historical set (not just window) ---
+      const takeNumeric = (arr, key) => arr.map(r => r[key]).filter(v => v !== undefined && v !== null && !Number.isNaN(v));
+  const observedVoltage = takeNumeric(allReadingsSorted, 'voltage');
+      const observedCurrent = takeNumeric(allReadingsSorted, 'current');
+      const observedPower = takeNumeric(allReadingsSorted, 'power');
+      const observedPF = takeNumeric(allReadingsSorted, 'powerFactor');
+      const observedFreq = takeNumeric(allReadingsSorted, 'frequency');
+      const observedEnergy = takeNumeric(allReadingsSorted, 'energyToday');
+
+      const minOr = (list, fallback) => list.length ? Math.min(...list) : fallback;
+      const maxOr = (list, fallback) => list.length ? Math.max(...list) : fallback;
+
+      // Daily energy delta (assumes energyToday is cumulative for the day)
+      let energyDelta = currentUsage.energyToday;
+      if (allReadingsSorted.length) {
+        const latestTs = allReadingsSorted[allReadingsSorted.length - 1].timestamp;
+        const dayStart = new Date(latestTs);
+        dayStart.setHours(0,0,0,0);
+        const baseline = allReadingsSorted.find(r => r.timestamp >= dayStart.getTime());
+        if (baseline && baseline.energyToday !== undefined) {
+          const latestEnergy = allReadingsSorted[allReadingsSorted.length - 1].energyToday ?? currentUsage.energyToday;
+          if (latestEnergy !== undefined && !Number.isNaN(latestEnergy)) {
+            energyDelta = Math.max(0, (latestEnergy - baseline.energyToday));
+          }
+        }
+      }
+
+      // Observed ranges
+  const voltageMin = minOr(observedVoltage, currentUsage.voltage - 2);
+      const voltageMax = maxOr(observedVoltage, currentUsage.voltage + 2);
+      const currentMin = minOr(observedCurrent, Math.max(0, currentUsage.current - 2));
+      const currentMax = maxOr(observedCurrent, currentUsage.current + 3);
+      const powerMin = minOr(observedPower, Math.max(0, currentUsage.power - 600));
+      const powerMax = maxOr(observedPower, currentUsage.power + 800);
+      const pfMin = minOr(observedPF, 0.8);
+      const pfMax = maxOr(observedPF, 0.95);
+      const freqMin = minOr(observedFreq, 49.8);
+      const freqMax = maxOr(observedFreq, 50.3);
+      const energyMin = observedEnergy.length ? Math.min(...observedEnergy) : 0;
+      const energyMax = observedEnergy.length ? Math.max(...observedEnergy) : currentUsage.energyToday;
+
+  // If device went offline after previously having realtime data, skip overwriting zeros.
+  // Allow recompute while offline only if we have never received realtime (lastRealtimeRef null) so sample shows.
+      // (No offline overwrite guard needed—freshness enforced earlier)
+      setMeterData(prev => ({
+        voltage: {
+          current: currentUsage.voltage,
+          min: Number(voltageMin.toFixed(2)),
+          max: Number(voltageMax.toFixed(2)),
+          status: powerQuality.status?.toLowerCase() || 'normal',
+          history: readings.map(r => r.voltage || currentUsage.voltage)
+        },
+        current: {
+          current: currentUsage.current,
+          min: Number(currentMin.toFixed(2)),
+          max: Number(currentMax.toFixed(2)),
+          status: 'normal',
+          history: readings.map(r => r.current || currentUsage.current)
+        },
+        power: {
+          current: currentUsage.power,
+          min: Math.max(0, Math.round(powerMin)),
+          max: Math.round(powerMax),
+          status: currentUsage.power > 3000 ? 'warning' : 'normal',
+          history: readings.map(r => r.power || currentUsage.power)
+        },
+        energy: {
+          // Use derived daily consumption delta
+          current: Number(energyDelta.toFixed(3)),
+          min: Number(energyMin.toFixed(3)),
+          max: Number(energyMax.toFixed(3)),
+          status: 'normal',
+          history: readings.map(r => r.energyToday || currentUsage.energyToday)
+        },
+        powerFactor: {
+          current: currentUsage.powerFactor,
+          min: Number(pfMin.toFixed(3)),
+          max: Number(pfMax.toFixed(3)),
+          status: currentUsage.powerFactor < 0.9 ? 'warning' : 'normal',
+          history: readings.map(r => r.powerFactor || currentUsage.powerFactor)
+        },
+        frequency: {
+          current: currentUsage.frequency,
+          min: Number(freqMin.toFixed(3)),
+          max: Number(freqMax.toFixed(3)),
+          status: 'normal',
+          history: readings.map(r => r.frequency || currentUsage.frequency)
+        }
+      }));
+
+      const format24 = (d) => {
+        const date = new Date(d);
+        const hh = String(date.getHours()).padStart(2,'0');
+        const mm = String(date.getMinutes()).padStart(2,'0');
+        const ss = String(date.getSeconds()).padStart(2,'0');
+        return `${hh}:${mm}:${ss}`;
+      };
+      setAlerts(alertsArray.slice(0, 5).map(a => ({
+        id: a.id || a.timestamp,
+        type: a.severity || 'info',
+        message: a.message,
+        time: a.originalTime || format24(a.timestamp)
+      })));
+      setLastUpdate(new Date());
+      setLoading(false);
+    }
+
+    // Initial recompute (no data yet -> offline zeros)
+    recompute();
+
+    // NEW: subscribe to hierarchical schema
+    const uReadings = subscribeReadings((flatArray) => {
+      callbacksCountRef.current += 1; // increment heartbeat count
+      lastAnyArrivalRef.current = Date.now();
+      // Cancel any pending offline retry refresh because data is flowing
+      if (autoRefreshTimerRef.current) {
+        clearTimeout(autoRefreshTimerRef.current);
+        autoRefreshTimerRef.current = null;
+      }
+      if (!flatArray.length) { recompute(); return; }
+      realtimeReceivedRef.current.currentUsage = true;
+      realtimeReceivedRef.current.meterReadings = true;
+      const latest = flatArray[flatArray.length - 1];
+      const usage = readingToUsage(latest);
+      const powerQuality = {
+        voltage: usage.voltage,
+        frequency: usage.frequency,
+        powerFactor: usage.powerFactor,
+        status: usage.powerFactor < 0.9 ? 'Fair' : 'Good'
+      };
+      const readingsKeyed = flatArray.reduce((acc, r) => {
+        const u = readingToUsage(r);
+        acc[r.timestamp] = {
+          timestamp: r.timestamp,
+          energyToday: u.energyToday,
+          voltage: u.voltage,
+          current: u.current,
+          power: u.power,
+          powerFactor: u.powerFactor,
+          frequency: u.frequency
+        };
+        return acc;
+      }, {});
+      stateRef.current = { ...stateRef.current, currentUsage: usage, powerQuality, meterReadings: readingsKeyed };
+      setUsingSampleOnly(false);
+      lastRealtimeRef.current = latest.timestamp;
+      recompute();
+    }, { currentDateOnly: false, log: true });
+    unsubscribers.push(uReadings);
+
+    const uEvents = subscribeEvents((flatEvents) => {
+      if (!flatEvents.length) return;
+      const alertsObj = flatEvents.slice(0, 50).reduce((acc, ev) => {
+        const raw = ev.raw || {};
+        const msg = raw.Event || raw.event || 'Event';
+        acc[ev.timestamp] = {
+          id: ev.timestamp,
+          type: 'event',
+          severity: /metal/i.test(msg) ? 'warning' : 'info',
+          message: msg,
+          timestamp: ev.timestamp,
+          originalTime: raw.Time || raw.time || null,
+          acknowledged: false
+        };
+        return acc;
+      }, {});
+      stateRef.current = { ...stateRef.current, alerts: alertsObj };
+      recompute(); // Do not mark device online from events alone
+    }, { currentDateOnly: false, log: true });
+    unsubscribers.push(uEvents);
+
+    return () => {
+      unsubscribers.forEach(fn => { try { fn(); } catch(_) {} });
+      if (autoRefreshTimerRef.current) clearTimeout(autoRefreshTimerRef.current);
     };
-    fetchData();
-    const interval = setInterval(fetchData, 30000);
-    return () => clearInterval(interval);
   }, []);
+
+  // Heartbeat watcher: mark offline if no realtime update in threshold (e.g., 30s)
+  useEffect(() => {
+    const OFFLINE_THRESHOLD_MS = 30000; // 30 seconds without new data
+    const interval = setInterval(() => {
+      const last = lastRealtimeRef.current; // may be null if never received
+      const referenceTime = last || startTimeRef.current; // if never received, use start time
+      const age = Date.now() - referenceTime;
+      if (age > OFFLINE_THRESHOLD_MS && deviceOnline) {
+        // Transition to offline
+        setDeviceOnline(false);
+        setMeterData(prev => {
+          const zeroHistory = (len) => Array.from({ length: len }, () => 0);
+          const templateHistoryLength = prev?.voltage?.history?.length || 10;
+          const build = (p = {}) => ({
+            current: 0,
+            min: 0,
+            max: 0,
+            status: 'offline',
+            history: zeroHistory(templateHistoryLength)
+          });
+          return {
+            voltage: build(prev?.voltage),
+            current: build(prev?.current),
+            power: build(prev?.power),
+            energy: { ...build(prev?.energy), history: zeroHistory(templateHistoryLength) },
+            powerFactor: build(prev?.powerFactor),
+            frequency: build(prev?.frequency)
+          };
+        });
+      }
+      // If offline but new realtime arrives, other effect will set deviceOnline true
+    }, 5000);
+    return () => clearInterval(interval);
+  }, [deviceOnline]);
   const getStatusColor = (status) => {
     switch (status) {
       case 'normal': return { borderLeft: '4px solid #10b981' };
       case 'warning': return { borderLeft: '4px solid #f59e0b' };
       case 'critical': return { borderLeft: '4px solid #ef4444' };
+      case 'offline': return { borderLeft: '4px solid #6b7280' };
       default: return { borderLeft: '4px solid #10b981' };
     }
   };
@@ -396,6 +780,7 @@ const CustomerDashboard = () => {
             <img src={Logo} alt="VoltSenseX Logo" style={responsiveStyles.logo} />
           </div>
           <h1 style={responsiveStyles.pageTitle}>Dashboard</h1>
+          {/* Live / Sample indicator removed per request */}
           <div 
             style={responsiveStyles.userProfile}
             onMouseOver={(e) => {
@@ -408,7 +793,7 @@ const CustomerDashboard = () => {
             }}
           >
             <UserIcon />
-            {!isMobile && <span style={{ fontSize: isMobile ? '0.8rem' : '0.875rem', fontWeight: '600', color: '#111827' }}>Consumer</span>}
+            <span style={{ fontSize: isMobile ? '0.7rem' : '0.875rem', fontWeight: '600', color: '#111827', maxWidth: isMobile ? '90px' : '160px', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{displayConsumerLabel}</span>
           </div>
         </div>
       </header>
@@ -429,7 +814,7 @@ const CustomerDashboard = () => {
           <h2 style={responsiveStyles.sectionTitle}>Live Meter Readings</h2>
           <div style={responsiveStyles.kpiGrid}>
             {/* Voltage Card */}
-            <div style={{ ...responsiveStyles.kpiCard, ...getStatusColor(meterData?.voltage?.status) }}>
+            <div style={{ ...responsiveStyles.kpiCard, ...getStatusColor(deviceOnline ? meterData?.voltage?.status : 'offline') }}>
               <div style={responsiveStyles.kpiHeader}>
                 <div style={responsiveStyles.kpiLabel}>
                   <VoltageIcon />
@@ -447,7 +832,7 @@ const CustomerDashboard = () => {
               <Sparkline data={meterData?.voltage?.history} color="#ea580c" />
             </div>
             {/* Current Card */}
-            <div style={{ ...responsiveStyles.kpiCard, ...getStatusColor(meterData?.current?.status) }}>
+            <div style={{ ...responsiveStyles.kpiCard, ...getStatusColor(deviceOnline ? meterData?.current?.status : 'offline') }}>
               <div style={responsiveStyles.kpiHeader}>
                 <div style={responsiveStyles.kpiLabel}>
                   <CurrentIcon />
@@ -465,7 +850,7 @@ const CustomerDashboard = () => {
               <Sparkline data={meterData?.current?.history} color="#0891b2" />
             </div>
             {/* Power Card */}
-            <div style={{ ...responsiveStyles.kpiCard, ...getStatusColor(meterData?.power?.status) }}>
+            <div style={{ ...responsiveStyles.kpiCard, ...getStatusColor(deviceOnline ? meterData?.power?.status : 'offline') }}>
               <div style={responsiveStyles.kpiHeader}>
                 <div style={responsiveStyles.kpiLabel}>
                   <PowerIcon />
@@ -483,7 +868,7 @@ const CustomerDashboard = () => {
               <Sparkline data={meterData?.power?.history} color="#ea580c" />
             </div>
             {/* Energy Card */}
-            <div style={{ ...responsiveStyles.kpiCard, ...getStatusColor(meterData?.energy?.status) }}>
+            <div style={{ ...responsiveStyles.kpiCard, ...getStatusColor(deviceOnline ? meterData?.energy?.status : 'offline') }}>
               <div style={responsiveStyles.kpiHeader}>
                 <div style={responsiveStyles.kpiLabel}>
                   <EnergyIcon />
@@ -501,7 +886,7 @@ const CustomerDashboard = () => {
               <Sparkline data={meterData?.energy?.history} color="#0891b2" />
             </div>
             {/* Power Factor Card */}
-            <div style={{ ...responsiveStyles.kpiCard, ...getStatusColor(meterData?.powerFactor?.status) }}>
+            <div style={{ ...responsiveStyles.kpiCard, ...getStatusColor(deviceOnline ? meterData?.powerFactor?.status : 'offline') }}>
               <div style={responsiveStyles.kpiHeader}>
                 <div style={responsiveStyles.kpiLabel}>
                   <PowerFactorIcon />
@@ -518,7 +903,7 @@ const CustomerDashboard = () => {
               <Sparkline data={meterData?.powerFactor?.history} color="#0891b2" />
             </div>
             {/* Frequency Card */}
-            <div style={{ ...responsiveStyles.kpiCard, ...getStatusColor(meterData?.frequency?.status) }}>
+            <div style={{ ...responsiveStyles.kpiCard, ...getStatusColor(deviceOnline ? meterData?.frequency?.status : 'offline') }}>
               <div style={responsiveStyles.kpiHeader}>
                 <div style={responsiveStyles.kpiLabel}>
                   <FrequencyIcon />
@@ -564,7 +949,7 @@ const CustomerDashboard = () => {
               style={{ ...responsiveStyles.navButton, ...(hoveredButton === 'charts' ? { backgroundColor: '#ea580c', color: '#fff', transform: 'translateY(-2px)', boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1)' } : {}) }}
               onMouseEnter={() => setHoveredButton('charts')}
               onMouseLeave={() => setHoveredButton(null)}
-              onClick={() => handleNavigation('/analytics')}
+              onClick={() => handleNavigation('/detailedcharts')}
             >
               Detailed Charts
             </button>
@@ -572,7 +957,7 @@ const CustomerDashboard = () => {
               style={{ ...responsiveStyles.navButton, ...(hoveredButton === 'billing' ? { backgroundColor: '#ea580c', color: '#fff', transform: 'translateY(-2px)', boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1)' } : {}) }}
               onMouseEnter={() => setHoveredButton('billing')}
               onMouseLeave={() => setHoveredButton(null)}
-              onClick={() => handleNavigation('/billing')}
+              onClick={() => handleNavigation('/billspage')}
             >
               Billing & Reports
             </button>
@@ -580,7 +965,7 @@ const CustomerDashboard = () => {
               style={{ ...responsiveStyles.navButton, ...(hoveredButton === 'events' ? { backgroundColor: '#ea580c', color: '#fff', transform: 'translateY(-2px)', boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1)' } : {}) }}
               onMouseEnter={() => setHoveredButton('events')}
               onMouseLeave={() => setHoveredButton(null)}
-              onClick={() => handleNavigation('/events')}
+              onClick={() => handleNavigation('/eventsAlerts')}
             >
               Events & Log
             </button>
@@ -588,7 +973,7 @@ const CustomerDashboard = () => {
               style={{ ...responsiveStyles.navButton, ...(hoveredButton === 'settings' ? { backgroundColor: '#ea580c', color: '#fff', transform: 'translateY(-2px)', boxShadow: '0 10px 15px -3px rgba(0,0,0,0.1)' } : {}) }}
               onMouseEnter={() => setHoveredButton('settings')}
               onMouseLeave={() => setHoveredButton(null)}
-              onClick={() => handleNavigation('/settings')}
+              onClick={() => handleNavigation('/settingsconfig')}
             >
               Settings
             </button>

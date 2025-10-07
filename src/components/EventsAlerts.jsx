@@ -1,4 +1,5 @@
-import React, { useEffect, useMemo, useState } from 'react';
+import React, { useEffect, useMemo, useState, useCallback, useRef } from 'react';
+import { subscribeEvents } from '../firebase';
 import { useNavigate } from 'react-router-dom';
 import Logo from '../assets/Logo.jpg';
 
@@ -128,18 +129,19 @@ table.ea-table tbody tr:hover { background:#fff7ed; }
 `; 
 
 const mockEvents = [
-	{ id: 'e1', time: '2025-09-29T16:00:00Z', type: 'Tamper', detail: 'Cover opened detection triggered.', severity: 'Critical', source: 'PPPRO-001', status: 'New', raw: { sensor: 'lid', code: 'COVER_OPEN', value: true } },
-	{ id: 'e2', time: '2025-09-29T15:15:00Z', type: 'Threshold', detail: 'Voltage under limit (UV) for 5 min.', severity: 'Warning', source: 'PPPRO-001', status: 'New', raw: { metric: 'voltage', avg: 176.2, threshold: 180 } },
-	{ id: 'e3', time: '2025-09-28T21:45:00Z', type: 'System', detail: 'Firmware updated successfully to v1.2.3', severity: 'Info', source: 'PPPRO-001', status: 'Ack', raw: { version: '1.2.3', previous: '1.2.2', result: 'OK' } },
-	{ id: 'e4', time: '2025-09-27T16:30:00Z', type: 'Threshold', detail: 'Power Factor low: 0.82 (lagging).', severity: 'Warning', source: 'PPPRO-001', status: 'New', raw: { pf: 0.82, mode: 'lagging' } },
-	{ id: 'e5', time: '2025-09-27T13:30:00Z', type: 'Tamper', detail: 'Magnetic field proximity detected.', severity: 'Critical', source: 'PPPRO-001', status: 'New', raw: { fieldGauss: 155 } }
+  { id: 'fallback-1', time: new Date().toISOString(), type: 'System', detail: 'Backend not reachable. Showing fallback data.', severity: 'Info', source: 'PPPRO-001', status: 'New', raw: { note:'offline-fallback'} }
 ];
 
 export default function EventsAlerts(){
 	const navigate = useNavigate();
-	const [events, setEvents] = useState(mockEvents);
+	const [events, setEvents] = useState([]);
 	const [selected, setSelected] = useState(new Set());
-	const [device, setDevice] = useState('PPPRO-001');
+	const [device, setDevice] = useState('ALL');
+	const [deviceOptions, setDeviceOptions] = useState([]); // dynamically discovered sources
+	const firebaseUnsubRef = useRef(null);
+	const [usingFirebase, setUsingFirebase] = useState(false);
+	const [dataMode, setDataMode] = useState('api'); // 'api' | 'firebase'
+	const fallbackStartedRef = useRef(false);
 	const [typeFilter, setTypeFilter] = useState('ALL');
 	const [severityFilter, setSeverityFilter] = useState('ALL');
 	const [statusFilter, setStatusFilter] = useState('ALL');
@@ -147,6 +149,188 @@ export default function EventsAlerts(){
 	const [toDate, setToDate] = useState('');
 	const [jsonEvent, setJsonEvent] = useState(null);
 	const [filtersOpen, setFiltersOpen] = useState(true);
+	const [loading, setLoading] = useState(false);
+	const [error, setError] = useState('');
+	const [autoRefresh, setAutoRefresh] = useState(true);
+	const [lastUpdated, setLastUpdated] = useState(null);
+	const [adminIdInput, setAdminIdInput] = useState('ADM0001');
+	const [adminPasswordInput, setAdminPasswordInput] = useState('');
+	const [authLoading, setAuthLoading] = useState(false);
+	const [authMessage, setAuthMessage] = useState('');
+	// Diagnostics state
+	const [debugInfo, setDebugInfo] = useState({ lastTest: null, testCount: 0, testError: '', testEvents: 0 });
+
+	const API_BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:5000';
+	const getToken = () => localStorage.getItem('authToken');
+	const capitalize = (s) => s.charAt(0) + s.slice(1).toLowerCase();
+
+	const mapEvent = (e)=>({
+		id: e._id,
+		time: e.occurredAt || e.createdAt || e.updatedAt || new Date().toISOString(),
+		type: e.type,
+		detail: e.detail,
+		severity: e.severity,
+		source: e.source || 'UNKNOWN',
+		status: e.status,
+		raw: e.raw || {}
+	});
+
+	const buildQuery = ()=>{
+		const params = new URLSearchParams();
+		params.set('limit','150');
+		if(typeFilter !== 'ALL') params.set('type', typeFilter);
+		if(severityFilter !== 'ALL') params.set('severity', capitalize(severityFilter));
+		if(statusFilter !== 'ALL') params.set('status', statusFilter === 'ACK' ? 'Ack':'New');
+		if(device && device !== 'ALL') params.set('source', device);
+		if(fromDate) params.set('from', fromDate);
+		if(toDate) params.set('to', toDate);
+		return params.toString();
+	};
+
+	// Merge + dedupe preserving ACK status
+	const mergeEvents = useCallback((prev, incoming)=>{
+		if(!Array.isArray(incoming) || !incoming.length) return prev.slice();
+		const map = new Map();
+		const keyOf = (e)=> e.id || `${e.time}|${e.type}|${(e.detail||'').slice(0,40)}`;
+		const add = (e)=>{
+			if(!e || !e.time) return;
+			const k = keyOf(e);
+			if(!map.has(k)) { map.set(k, e); return; }
+			const existing = map.get(k);
+			// Preserve ACK if existing acknowledged
+			const merged = { ...existing, ...e };
+			if(existing.status === 'Ack' && e.status !== 'Ack') merged.status = 'Ack';
+			map.set(k, merged);
+		};
+		prev.forEach(add);
+		incoming.forEach(add);
+		return Array.from(map.values())
+			.sort((a,b)=> new Date(b.time)-new Date(a.time))
+			.slice(0,500); // cap list
+	},[]);
+
+	const fetchEvents = useCallback(async ({ manual=false }={})=>{
+		// If we're already in firebase fallback mode and this is an auto refresh (not manual), skip to avoid flicker
+		if(dataMode==='firebase' && !manual) return;
+		setLoading(true); setError('');
+		try {
+			const qs = buildQuery();
+			const token = getToken();
+			const endpoint = token ? `/api/events/list?${qs}` : `/api/events/public?${qs}`;
+			const res = await fetch(`${API_BASE}${endpoint}`, { headers: token? { 'Authorization': `Bearer ${token}` }: {} });
+			if(!res.ok){
+				let msg = `HTTP ${res.status}`;
+				if(res.status === 401 || res.status === 403) msg += ' (unauthorized)';
+				throw new Error(msg);
+			}
+			const data = await res.json();
+			const evts = (data.data?.events||[]).map(mapEvent);
+			// derive device/source list
+			const sources = Array.from(new Set(evts.map(e=> e.source).filter(Boolean))).sort();
+			setDeviceOptions(sources);
+			setEvents(prev=> mergeEvents(prev, evts));
+			setLastUpdated(new Date());
+			setSelected(prev => new Set([...prev].filter(id => evts.some(e=>e.id===id))));
+			if(dataMode!=='api') { setDataMode('api'); setUsingFirebase(false); }
+		} catch(err){
+			console.error('Fetch events failed', err);
+			if(!events.length){ setEvents(mockEvents); }
+			setError(`Unable to load live events: ${err.message}`);
+			// Fallback: start firebase subscription if not already
+			if(!firebaseUnsubRef.current){
+				firebaseUnsubRef.current = subscribeEvents((rows)=>{
+					// rows: [{ timestamp, date, raw:{ Event, Time, ... } }]
+					const mapped = rows.map(r=>{
+						let baseTs = r.timestamp;
+						// Attempt to refine timestamp using raw Time (HH:MM[:SS]) and date folder if present
+						const timeStr = r.raw?.Time || r.raw?.time;
+						if(timeStr && r.date){
+							const m = /^([0-2]?\d):([0-5]\d)(?::([0-5]\d))?$/.exec(timeStr.trim());
+							if(m){
+								const [, hh, mm, ss] = m;
+								const [Y,M,D] = r.date.split('-').map(Number);
+								const dt = new Date(Y, (M||1)-1, D||1, Number(hh), Number(mm), ss? Number(ss):0, 0);
+								// If difference > 2 minutes treat parsed as authoritative
+								if(Math.abs(dt.getTime()-baseTs) > 120000) baseTs = dt.getTime();
+							}
+						}
+						const typeVal = (r.raw?.EventType || r.raw?.Type || r.raw?.EventTypeName || r.raw?.Event || 'Unknown');
+						const detailVal = (r.raw?.Event || r.raw?.Message || r.raw?.Detail || r.raw?.Description || 'Event');
+						let sev = (r.raw?.Severity || r.raw?.Level || 'Info').toString().replace(/^[a-z]/, m=>m.toUpperCase());
+						const blob = `${typeVal} ${detailVal} ${JSON.stringify(r.raw||{})}`.toLowerCase();
+						const doorMetalPattern = /(door|cover|enclosure|lid)\s*open|metal\s*detect|metal\s*detected|magnet|magnetic\s*field/;
+						const voltagePattern = /(voltage\s+under|voltage\s+over|under\s*voltage|over\s*voltage|uv\)|ov\))/;
+						if(typeVal.toLowerCase()==='system') sev='Info';
+						if(doorMetalPattern.test(blob)) sev='Critical';
+						else if(voltagePattern.test(blob) && sev!=='Critical') sev='Warning';
+						return {
+							id: baseTs.toString(),
+							time: new Date(baseTs).toISOString(),
+							type: typeVal,
+							detail: detailVal,
+							severity: sev,
+							source: r.raw?.Source || r.raw?.Device || r.raw?.Meter || 'PPPRO-001',
+							status: 'New',
+							raw: r.raw || {}
+						};
+					});
+					// Merge; preserve previous if mapped empty
+					setEvents(prev => mapped.length ? mergeEvents(prev, mapped) : prev);
+					const sources = Array.from(new Set(mapped.map(e=> e.source).filter(Boolean))).sort();
+					if(sources.length) setDeviceOptions(sources);
+					setUsingFirebase(true);
+					if(!fallbackStartedRef.current){ setDataMode('firebase'); fallbackStartedRef.current = true; }
+				}, { currentDateOnly:false, log:false });
+			}
+		} finally { setLoading(false); }
+	}, [API_BASE, typeFilter, severityFilter, statusFilter, device, fromDate, toDate, dataMode, mergeEvents]);
+
+	// Inline admin login to obtain token if missing / unauthorized
+	const performAdminLogin = async (e) => {
+		if(e) e.preventDefault();
+		setAuthMessage('');
+		setAuthLoading(true);
+		try {
+			const res = await fetch(`${API_BASE}/api/auth/admin/login`, {
+				method:'POST',
+				headers:{'Content-Type':'application/json'},
+				body: JSON.stringify({ adminId: adminIdInput.trim(), password: adminPasswordInput })
+			});
+			if(!res.ok){
+				let msg = `Login failed (${res.status})`;
+				try { const j = await res.json(); if(j.message) msg += `: ${j.message}`; } catch(_){}
+				throw new Error(msg);
+			}
+			const data = await res.json();
+			const token = data?.data?.token;
+			if(!token) throw new Error('Token missing in response');
+			localStorage.setItem('authToken', token);
+			setAuthMessage('Login successful. Fetching events...');
+			setAdminPasswordInput('');
+			await fetchEvents();
+		} catch(err){
+			console.error('Admin login error', err);
+			setAuthMessage(err.message);
+		} finally { setAuthLoading(false); }
+	};
+
+	const clearToken = () => {
+		localStorage.removeItem('authToken');
+		setAuthMessage('Token cleared. Please log in again.');
+		setEvents([]);
+	};
+
+	useEffect(()=>{ fetchEvents({ manual:true }); }, [fetchEvents]);
+
+	// Cleanup firebase subscription on unmount
+	useEffect(()=>()=>{ if(firebaseUnsubRef.current){ firebaseUnsubRef.current(); firebaseUnsubRef.current=null; } },[]);
+
+	useEffect(()=>{
+		if(!autoRefresh) return;
+		if(dataMode==='firebase') return; // don't poll API while on firebase mode
+		const id = setInterval(()=> fetchEvents({ manual:false }), 15000);
+		return ()=> clearInterval(id);
+	}, [autoRefresh, fetchEvents, dataMode]);
 
 	// lock scroll when modal open
 	useEffect(()=>{
@@ -167,7 +351,7 @@ export default function EventsAlerts(){
 
 	const filtered = useMemo(()=>{
 		return events.filter(ev=>{
-			if(device && ev.source!==device) return false;
+			if(device && device !== 'ALL' && ev.source!==device) return false;
 			if(typeFilter!=='ALL' && ev.type!==typeFilter) return false;
 			if(severityFilter!=='ALL' && ev.severity.toUpperCase()!==severityFilter) return false;
 			if(statusFilter!=='ALL' && ev.status.toUpperCase()!==statusFilter) return false;
@@ -185,10 +369,28 @@ export default function EventsAlerts(){
 	function toggleSelectAll(){
 		if(selected.size === filtered.length){ setSelected(new Set()); } else { setSelected(new Set(filtered.map(e=>e.id))); }
 	}
-	function acknowledge(ids){
+	async function acknowledge(ids){
 		if(!ids.length) return;
-		setEvents(evts=> evts.map(e=> ids.includes(e.id)? { ...e, status:'Ack'}: e));
-		setSelected(new Set());
+		const token = getToken();
+		if(!token){
+			// optimistic only
+			setEvents(evts=> evts.map(e=> ids.includes(e.id)? { ...e, status:'Ack'}: e));
+			setSelected(new Set());
+			return;
+		}
+		try {
+			await fetch(`${API_BASE}/api/events/ack`, {
+				method:'POST',
+				headers:{ 'Content-Type':'application/json', 'Authorization':`Bearer ${token}` },
+				body: JSON.stringify({ ids })
+			});
+			await fetchEvents();
+			setSelected(new Set());
+		}catch(err){
+			console.error('Ack failed', err);
+			setEvents(evts=> evts.map(e=> ids.includes(e.id)? { ...e, status:'Ack'}: e));
+			setSelected(new Set());
+		}
 	}
 	function handleAckSelected(){ acknowledge(Array.from(selected)); }
 	function handleClearAll(){
@@ -206,7 +408,21 @@ export default function EventsAlerts(){
 		return d.toLocaleDateString('en-GB',{ day:'2-digit', month:'2-digit', year:'numeric'}) + ', ' + d.toLocaleTimeString('en-GB',{ hour:'2-digit', minute:'2-digit', second:'2-digit'});
 	}
 
-	const uniqueTypes = useMemo(()=> Array.from(new Set(events.map(e=>e.type))), [events]);
+	const uniqueTypes = useMemo(()=> Array.from(new Set(events.map(e=>e.type))).filter(Boolean), [events]);
+	const hasToken = !!getToken();
+	const refreshNow = ()=> fetchEvents({ manual:true });
+
+	async function runPublicTest(){
+		try {
+			const res = await fetch(`${API_BASE}/api/events/public?limit=5&_ts=${Date.now()}`);
+			if(!res.ok) throw new Error(`HTTP ${res.status}`);
+			const json = await res.json();
+			const arr = json?.data?.events || [];
+			setDebugInfo(d=>({ ...d, lastTest: new Date(), testCount: d.testCount+1, testEvents: arr.length, testError:'' }));
+		} catch(e){
+			setDebugInfo(d=>({ ...d, lastTest: new Date(), testCount: d.testCount+1, testError: e.message }));
+		}
+	}
 
 	return (
 		<div className="ea-container ea-root">
@@ -230,7 +446,8 @@ export default function EventsAlerts(){
 						<div className="ea-field">
 							<label htmlFor="device" style={{display:'none'}}>Device</label>
 							<select id="device" className="ea-select" value={device} onChange={e=>setDevice(e.target.value)}>
-								<option value="PPPRO-001">PPPRO-001 (Current)</option>
+								<option value="ALL">All Devices</option>
+								{deviceOptions.map(src=> <option key={src} value={src}>{src}</option>)}
 							</select>
 						</div>
 						<div className="ea-field">
@@ -268,45 +485,65 @@ export default function EventsAlerts(){
 					</div>
 				</div>
 				<div className="ea-actions-bar">
-					<button className="ea-btn ea-btn-ack" disabled={!selected.size} onClick={handleAckSelected}>
+					<button className="ea-btn" onClick={refreshNow} disabled={loading} style={{background:'#0891b2', color:'#fff'}}>{loading? 'Refreshing…':'Refresh'}</button>
+					<button className="ea-btn" onClick={()=>setAutoRefresh(a=>!a)} style={{background: autoRefresh? '#f59e0b':'#475569', color:'#fff'}}>{autoRefresh? 'Auto: ON':'Auto: OFF'}</button>
+					<button className="ea-btn ea-btn-ack" disabled={!selected.size || !hasToken} onClick={handleAckSelected} title={hasToken? 'Acknowledge selected events':'Login required for acknowledgement'}>
 						Acknowledge Selected ({selected.size})
 					</button>
 					<button className="ea-btn ea-btn-export" disabled={!filtered.length} onClick={exportCSV}>
 						Export CSV ({filtered.length})
 					</button>
 						<button className="ea-btn ea-btn-clear" onClick={handleClearAll}>Clear All</button>
+					{lastUpdated && <span style={{fontSize:'.58rem', fontWeight:600, color:'#475569'}}>Updated {lastUpdated.toLocaleTimeString()}</span>}
 				</div>
+					{/* Diagnostics Panel (dev only UI) */}
+					<div style={{margin:'0 0 .9rem', padding:'.55rem .75rem', background:'#fff', border:'1px solid #e2e8f0', borderRadius:10, display:'flex', flexWrap:'wrap', gap:'.7rem', alignItems:'center'}}>
+						<span style={{fontSize:'.6rem', fontWeight:700}}>Diagnostics:</span>
+						<span style={{fontSize:'.58rem'}}>Mode: <strong>{dataMode}</strong></span>
+						<span style={{fontSize:'.58rem'}}>API Base: <code style={{fontSize:'.58rem'}}>{API_BASE}</code></span>
+						{lastUpdated && <span style={{fontSize:'.58rem'}}>Last API fetch: {lastUpdated.toLocaleTimeString()}</span>}
+						<button type="button" onClick={runPublicTest} style={{fontSize:'.55rem', padding:'.4rem .6rem', border:'1px solid #94a3b8', background:'#f1f5f9', borderRadius:8, cursor:'pointer'}}>Test Public Endpoint</button>
+						{debugInfo.lastTest && <span style={{fontSize:'.55rem'}}>Test #{debugInfo.testCount}: {debugInfo.testError? `Error: ${debugInfo.testError}`:`OK (${debugInfo.testEvents} events)`}</span>}
+						{usingFirebase && <span style={{fontSize:'.55rem', color:'#2563eb'}}>Firebase live fallback active</span>}
+					</div>
+				{error && <div style={{margin:'0 0 .6rem', fontSize:'.65rem', fontWeight:600, color:'#dc2626'}} role="alert">{error}{usingFirebase && ' (Showing live Firebase feed instead)'} </div>}
+				{dataMode==='firebase' && !error && <div style={{margin:'0 0 .6rem', fontSize:'.58rem', fontWeight:600, color:'#2563eb'}}>Live (Firebase fallback) mode. Manual Refresh will retry API.</div>}
 				<div className="ea-table-wrapper" role="region" aria-label="Events table">
 					<table className="ea-table">
 						<thead>
 							<tr>
-								<th className="ea-col-checkbox"><input type="checkbox" className="ea-checkbox" aria-label="Select All" onChange={toggleSelectAll} checked={selected.size && selected.size===filtered.length} /></th>
+								{hasToken && <th className="ea-col-checkbox"><input type="checkbox" className="ea-checkbox" aria-label="Select All" onChange={toggleSelectAll} checked={selected.size && selected.size===filtered.length} /></th>}
 								<th>Time (ISO)</th>
 								<th>Type</th>
 								<th>Detail</th>
 								<th>Severity</th>
 								<th>Source</th>
-								<th>Actions</th>
+								{hasToken && <th>Actions</th>}
 							</tr>
 						</thead>
 						<tbody>
-							{!filtered.length && (
-								<tr><td colSpan={7} style={{textAlign:'center', padding:'1.2rem', color:'var(--ea-text-dim)', fontWeight:600}}>No events match current filters.</td></tr>
+							{loading && !events.length && (
+								<tr><td colSpan={hasToken?7:6} style={{textAlign:'center', padding:'1rem', fontWeight:600}}>Loading events…</td></tr>
+							)}
+							{!loading && !filtered.length && (
+								<tr><td colSpan={hasToken?7:6} style={{textAlign:'center', padding:'1.2rem', color:'var(--ea-text-dim)', fontWeight:600}}>No events match current filters.</td></tr>
 							)}
 							{filtered.map(ev=>{
 								const sevClass = ev.severity==='Critical'?'ea-row-critical': ev.severity==='Warning'?'ea-row-warning':'ea-row-info';
 								return (
 									<tr key={ev.id} className={sevClass}>
-										<td data-label="Select" className="ea-col-checkbox"><input aria-label={`Select event ${ev.id}`} type="checkbox" className="ea-checkbox" checked={selected.has(ev.id)} onChange={()=>toggleSelect(ev.id)} /></td>
+										{hasToken && <td data-label="Select" className="ea-col-checkbox"><input aria-label={`Select event ${ev.id}`} type="checkbox" className="ea-checkbox" checked={selected.has(ev.id)} onChange={()=>toggleSelect(ev.id)} /></td>}
 										<td data-label="Time" style={{whiteSpace:'nowrap'}}>{formatTime(ev.time)}</td>
 										<td data-label="Type" className="ea-type">{ev.type}</td>
 										<td data-label="Detail" className="ea-detail-cell" style={{minWidth:'200px'}}>{ev.detail}</td>
 										<td data-label="Severity"><span className={`ea-badge ${ev.severity==='Critical'?'sev-critical':ev.severity==='Warning'?'sev-warning':'sev-info'}`}>{ev.severity}</span></td>
 										<td data-label="Source">{ev.source}</td>
-										<td data-label="Actions" style={{display:'flex', gap:'.4rem'}}>
-											{ev.status==='New' && <button className="ea-ack-btn" onClick={()=>acknowledge([ev.id])}>Ack</button>}
-											<button className="ea-json-btn" onClick={()=>setJsonEvent(ev)}>View JSON</button>
-										</td>
+										{hasToken && (
+											<td data-label="Actions" style={{display:'flex', gap:'.4rem'}}>
+												{ev.status==='New' && <button className="ea-ack-btn" onClick={()=>acknowledge([ev.id])}>Ack</button>}
+												<button className="ea-json-btn" onClick={()=>setJsonEvent(ev)}>View JSON</button>
+											</td>
+										)}
 									</tr>
 								);
 							})}
